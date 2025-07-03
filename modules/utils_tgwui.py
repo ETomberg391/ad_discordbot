@@ -446,7 +446,8 @@ def custom_chatbot_wrapper(text, state, regenerate=False, _continue=False, loadi
         if state['mode'] in ['chat', 'chat-instruct']:
             visible_reply = re.sub("(<USER>|<user>|{{user}})", state['name1'], reply)
 
-        visible_reply = html.escape(visible_reply)
+        if not state.get('skip_html_escape'):
+            visible_reply = html.escape(visible_reply)
 
         if shared.stop_everything:
             output['visible'][-1][1] = extensions_module.apply_extensions('output', output['visible'][-1][1], state, is_chat=True)

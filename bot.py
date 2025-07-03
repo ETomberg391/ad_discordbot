@@ -51,6 +51,7 @@ from modules.history import HistoryManager, History, HMessage, cnf
 from modules.typing import AlertUserError, TAG
 from modules.utils_asyncio import generate_in_executor
 from modules.tags import base_tags, persistent_tags, Tags, TAG_LIST
+from modules.precise_chat_module import get_precise_answer
 
 from discord.ext.commands.errors import HybridCommandError, CommandError
 from discord.errors import DiscordException
@@ -1614,8 +1615,25 @@ class TaskProcessing(TaskAttributes):
         self.apply_server_mode()
         # Update names in stopping strings
         self.extra_stopping_strings()
-        # generate text with text-generation-webui
-        await self.llm_gen()
+        
+        # Check if precise_answers_mode is enabled for this channel
+        precise_mode_enabled = bot_database.get_precise_answers_mode(self.channel.id)
+
+        if precise_mode_enabled:
+            log.info(f"Precise answers mode is enabled for channel {self.channel.id}. Using get_precise_answer.")
+            bot_statistics._llm_gen_time_start_last = time.time()
+            self.llm_resp = await get_precise_answer(
+                text=self.payload['text'],
+                state=self.payload['state'],
+                regenerate=self.payload.get('regenerate', False),
+                _continue=self.payload.get('_continue', False)
+            )
+            if self.llm_resp:
+                self.update_llm_gen_statistics()
+        else:
+            # generate text with text-generation-webui
+            await self.llm_gen()
+            
         # Toggle TTS back on if it was toggled off
         if tts_sw:
             await toggle_any_tts(self.settings, tts_sw, force='on')
@@ -5297,6 +5315,19 @@ async def sync(ctx: commands.Context):
     await ctx.reply('Syncing client tree. Note: Menus may not update instantly.', ephemeral=True, delete_after=15)
     log.info(f"{ctx.author.display_name} used '/sync' to sync the client.tree (refresh commands).")
     await bg_task_queue.put(client.tree.sync()) # Process this in the background
+
+@client.hybrid_command(description="Toggle precise answers mode for this channel.")
+@guild_only()
+async def precise_answers(ctx: commands.Context):
+    """Toggles the precise answer mode for the current channel."""
+    channel_id = ctx.channel.id
+    current_state = bot_database.get_precise_answers_mode(channel_id)
+    new_state = not current_state
+    bot_database.set_precise_answers_mode(channel_id, new_state)
+    
+    status = "enabled" if new_state else "disabled"
+    await ctx.reply(f"Precise answers mode has been **{status}** for this channel.", ephemeral=True)
+    log.info(f'{ctx.author.display_name} used "/precise_answers" in channel {channel_id}. Mode is now {status}.')
 
 #################################################################
 ######################### LLM COMMANDS ##########################

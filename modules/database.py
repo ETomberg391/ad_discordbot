@@ -164,6 +164,7 @@ class Database(BaseFileMemory):
         self.settings_channels:dict[int, int]
         self.settings_sent:dict[dict[str, int]]
         self.warned_once:dict[str, bool]
+        self.precise_answers_channels:list[int]
 
         super().__init__(shared_path.database, version=2, missing_okay=True)
 
@@ -205,6 +206,7 @@ class Database(BaseFileMemory):
         self.voice_channels = data.pop('voice_channels', {})
         self.settings_channels = data.pop('settings_channels', {})
         self.settings_sent = data.pop('settings_sent', {})
+        self.precise_answers_channels = data.pop('precise_answers_channels', [])
         data['warned_once'] = {}
 
     def save_pre_process(self, data):
@@ -300,6 +302,22 @@ class Database(BaseFileMemory):
             return
         # Update settings key value with new msg ids list
         self.settings_sent[guild_id][key] = new_msg_ids
+        if save_now:
+            self.save()
+
+    # Precise answers management
+    def get_precise_answers_mode(self, channel_id: int) -> bool:
+        """Checks if precise answers mode is enabled for a given channel."""
+        return channel_id in self.precise_answers_channels
+
+    def set_precise_answers_mode(self, channel_id: int, enabled: bool, save_now: bool = True):
+        """Sets the precise answers mode for a given channel."""
+        if enabled:
+            if channel_id not in self.precise_answers_channels:
+                self.precise_answers_channels.append(channel_id)
+        else:
+            if channel_id in self.precise_answers_channels:
+                self.precise_answers_channels.remove(channel_id)
         if save_now:
             self.save()
 

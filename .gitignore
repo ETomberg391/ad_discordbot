@@ -19,3 +19,7 @@ user_images/*
 wildcards/*
 
 user/*
+CMD_FLAGS.txt
+examples/characters/Ecne_Bot.yaml
+examples/characters/Evil_Ecne.yaml
+CMD_FLAGS.txt
