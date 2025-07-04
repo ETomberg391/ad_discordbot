@@ -63,7 +63,22 @@ async def get_precise_answer(text, state, **kwargs):
     state['skip_html_escape'] = True
 
     # --- PROMPTS ---
-    refiner_prompt = """You are a text formatting assistant. Your task is to take the provided text and clean it up. Extract only the pure, in-character, first-person response. Remove all meta-commentary, thinking, or third-person descriptions. Enclose the final, clean response in <chatting> and </chatting> tags. This is your only job. Do not add any new content or change the meaning of the original response."""
+    refiner_prompt_template = """Transform the following text into a clean response. Remove all third-person descriptions and meta-commentary. Enclose the final, pure first-person response in <chatting> tags.
+
+--- EXAMPLE ---
+TEXT TO REFINE:
+*He tilts his head.* I am well, thank you. How are you?
+
+REFINED OUTPUT:
+<chatting>I am well, thank you. How are you?</chatting>
+--- END EXAMPLE ---
+
+--- TASK ---
+TEXT TO REFINE:
+{pass1_raw_output}
+
+REFINED OUTPUT:
+"""
 
     max_retries = 3
     raw_attempts = []
@@ -88,8 +103,8 @@ async def get_precise_answer(text, state, **kwargs):
         refiner_state = copy.deepcopy(state)
         refiner_state['stream'] = False  # We need the full response for parsing, so disable streaming
 
-        # Construct the prompt for the refiner
-        refiner_prompt_text = f"{refiner_prompt}\n\n--- TEXT TO REFINE ---\n{pass1_raw_output}\n\n--- REFINED OUTPUT ---\n"
+        # Construct the prompt for the refiner using the few-shot template
+        refiner_prompt_text = refiner_prompt_template.format(pass1_raw_output=pass1_raw_output)
 
         # Use the low-level generate_reply for raw text completion
         # This is a synchronous generator, so we need to handle it accordingly

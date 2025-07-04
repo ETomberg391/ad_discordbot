@@ -1,49 +1,47 @@
-# Final Definitive Plan: Two-Pass Refinement with Correct Tooling
+# Final Definitive Plan v4: Two-Pass Architecture with Few-Shot Prompting
 
-## 1. Objective
+## 1. The Core Insight
 
-To implement a two-pass system that reliably separates creative response generation from strict output formatting by using the correct underlying function for each task.
+The user correctly identified that the two-pass architecture is fundamentally sound, but the Refiner pass is inconsistent. The solution is not to abandon the architecture, but to improve the instructions given to the Refiner.
 
-## 2. The Core Problem
+## 2. The Final Architecture: Two-Pass with a Better Prompt
 
-Previous attempts failed because we were using a **conversational** function (`custom_chatbot_wrapper`) for a **text-transformation** task. This caused the AI to "reply to" the text from the first pass instead of "refining" it.
+The system will use the two-pass architecture. The key change is the implementation of a "few-shot" prompt for the second pass, which gives the AI a direct command and a clear example to follow, making its output far more reliable.
 
-## 3. The Final Architecture: Using the Right Tool for the Job
-
-The two-pass system will be implemented as follows:
-
-### Pass 1: The "Creative" Pass (Conversational)
+### Pass 1: Creative Pass
 *   **Function:** `custom_chatbot_wrapper`
-*   **Goal:** To generate a rich, in-character response.
-*   **Why:** This function is designed for conversation. It correctly handles history, character context, and user input to generate a creative reply.
-*   **Output:** A potentially messy raw text that contains the desired response.
+*   **Goal:** Generate a rich, in-character response. This is working correctly.
 
-### Pass 2: The "Refiner" Pass (Raw Text Completion)
+### Pass 2: Refiner Pass
 *   **Function:** `generate_reply`
-*   **Goal:** To take the raw output from Pass 1 and strictly reformat it.
-*   **Why:** This is a lower-level function that performs a direct text completion. It will take the `refiner_prompt` and the messy text from Pass 1 and transform it into the desired clean format without trying to have a conversation.
-*   **Output:** A clean response enclosed in `<chatting>` tags.
+*   **Goal:** Clean and format the output from Pass 1.
+*   **The Fix:** Use a new, non-conversational "few-shot" prompt that provides a clear example of the required transformation.
 
-## 4. Diagram of the Final Flow
+## 3. The New "Few-Shot" Refiner Prompt
 
-```mermaid
-graph TD
-    A[Start Request] --> B[Pass 1: Creative];
-    B -- Use `custom_chatbot_wrapper` --> B;
-    B --> C[Get Raw, Messy Output];
-    C --> D[Pass 2: Refiner];
-    D -- Use `generate_reply` --> D;
-    D --> E[Get Clean, Formatted Output];
-    E --> F{Extract `<chatting>` block};
-    F --> G[Return Final Answer];
+```python
+refiner_prompt_template = """Transform the following text into a clean response. Remove all third-person descriptions and meta-commentary. Enclose the final, pure first-person response in <chatting> tags.
+
+--- EXAMPLE ---
+TEXT TO REFINE:
+*He tilts his head.* I am well, thank you. How are you?
+
+REFINED OUTPUT:
+<chatting>I am well, thank you. How are you?</chatting>
+--- END EXAMPLE ---
+
+--- TASK ---
+TEXT TO REFINE:
+{pass1_raw_output}
+
+REFINED OUTPUT:
+"""
 ```
 
-## 5. Implementation Steps
+## 4. Implementation Steps
 
-1.  **User Approval:** Confirm this final, definitive plan is correct.
+1.  **User Approval:** Confirm this final plan, centered on the new refiner prompt, is correct.
 2.  **Switch to Code Mode:** Transition to implement the code changes.
 3.  **Modify `modules/precise_chat_module.py`:**
-    *   Import `generate_reply` from `modules.text_generation`.
-    *   The first pass will continue to use `custom_chatbot_wrapper`.
-    *   The second pass will be re-written to call `generate_reply`. It will construct a single prompt string containing the `refiner_prompt` and the messy text from Pass 1.
-    *   The final parsing logic will operate on the result of `generate_reply`.
+    *   Replace the old `refiner_prompt` string with the new `refiner_prompt_template`.
+    *   Update the call to `generate_reply` to correctly format the prompt with the output from Pass 1.
