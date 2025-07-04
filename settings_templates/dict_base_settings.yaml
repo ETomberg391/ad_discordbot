@@ -95,7 +95,7 @@ llmstate:
     penalty_alpha: 0
     presence_penalty: 0
     prompt_lookup_num_tokens: 0
-    repetition_penalty: 1.18
+    repetition_penalty: 1.30
     repetition_penalty_range: 1024
     sampler_priority: []
     seed: -1.0
@@ -106,14 +106,14 @@ llmstate:
     static_cache: false
     stop_at_newline: false
     stopping_strings: []
-    stream: true
-    temperature: 0.98
+    stream: false
+    temperature: 0.6
     temperature_last: false
     tfs: 1
     top_a: 0
-    top_k: 100
+    top_k: 20
     top_n_sigma: 0
-    top_p: 0.37
+    top_p: 0.95
     truncation_length: 2048
     turn_template: ''
     typical_p: 1

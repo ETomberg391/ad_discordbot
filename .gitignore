@@ -23,3 +23,5 @@ CMD_FLAGS.txt
 examples/characters/Ecne_Bot.yaml
 examples/characters/Evil_Ecne.yaml
 CMD_FLAGS.txt
+settings_templates/dict_base_settings.yaml
+

@@ -3,6 +3,7 @@ import asyncio
 from functools import partial
 import copy
 from modules.utils_tgwui import custom_chatbot_wrapper
+from modules.text_generation import generate_reply
 from modules.utils_asyncio import generate_in_executor
 import os
 from datetime import datetime
@@ -10,100 +11,114 @@ from datetime import datetime
 LOG_DIR = 'modules/precise_logs'
 SESSION_LOG_FILE = None
 
-def log_precise_answer(input_text, raw_output, final_answer):
-    """Logs the input, raw output, and final answer to a single session log file."""
+def _initialize_session_log():
+    """(Internal) Creates a single log file for the bot's entire session."""
     global SESSION_LOG_FILE
     os.makedirs(LOG_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    SESSION_LOG_FILE = os.path.join(LOG_DIR, f"session_{timestamp}.log")
 
-    if SESSION_LOG_FILE is None:
-        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-        SESSION_LOG_FILE = os.path.join(LOG_DIR, f"{timestamp}_precise_session.log")
+def log_precise_entry(input_text, attempts_list, final_answer, source):
+    """Logs a complete interaction entry to the session log file, supporting two-pass architecture."""
+    if not SESSION_LOG_FILE:
+        return
 
     log_content = (
         f"--- ENTRY @ {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')} ---\n"
         f"--- INPUT ---\n{input_text}\n\n"
-        f"--- RAW LLM OUTPUT ---\n{raw_output}\n\n"
-        f"--- FINAL ANSWER ---\n{final_answer}\n"
+    )
+
+    for i, attempt_data in enumerate(attempts_list):
+        # Handle both old string-based attempts and new dict-based attempts for compatibility
+        if isinstance(attempt_data, dict):
+            pass1_out = attempt_data.get("pass1_creative_output", "N/A")
+            pass2_out = attempt_data.get("pass2_refined_output", "N/A")
+            log_content += (
+                f"--- ATTEMPT {i + 1} ---\n"
+                f"--- PASS 1 (Creative) RAW OUTPUT ---\n{pass1_out}\n\n"
+                f"--- PASS 2 (Refiner) RAW OUTPUT ---\n{pass2_out}\n\n"
+            )
+        else:  # Fallback for old log format
+            log_content += f"--- ATTEMPT {i + 1} RAW LLM OUTPUT ---\n{attempt_data}\n\n"
+
+    log_content += (
+        f"--- FINAL ANSWER ({source}) ---\n{final_answer}\n"
         f"--------------------------------------------------\n\n"
     )
-    
+
     with open(SESSION_LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(log_content)
 
+# Initialize the log file once, when this module is first imported.
+_initialize_session_log()
+
+
 async def get_precise_answer(text, state, **kwargs):
     """
-    Generates a precise answer by instructing the LLM to use <chatting> tags,
-    parsing the response, and extracting the content from within the tags.
-    Includes a retry mechanism and an enhanced system prompt.
+    Generates a precise answer using a two-pass refinement architecture.
+    1. Creative Pass: Generates a rich, in-character response.
+    2. Refiner Pass: Cleans and formats the response from Pass 1.
     """
     # Set flag to skip HTML escaping in the core wrapper
     state['skip_html_escape'] = True
 
-    # A more robust system prompt to enforce the desired output format.
-    system_prompt = """Your thought process should be outside of the chatting tags. Your final response to the user should be in-character and enclosed within <chatting> and </chatting> tags.
-
-Example:
-USER: What is 2+2?
-ASSISTANT: The user is asking a simple math question. I will answer it in character.
-<chatting>An easy one! The answer is 4.</chatting>
-
-Your final, user-facing response MUST be inside <chatting> tags."""
-    
-    # Safely get the original context and prepend the system prompt
-    original_context = state.get('context', '')
-    state['context'] = f"{system_prompt}\n\n{original_context}"
+    # --- PROMPTS ---
+    refiner_prompt = """You are a text formatting assistant. Your task is to take the provided text and clean it up. Extract only the pure, in-character, first-person response. Remove all meta-commentary, thinking, or third-person descriptions. Enclose the final, clean response in <chatting> and </chatting> tags. This is your only job. Do not add any new content or change the meaning of the original response."""
 
     max_retries = 3
-    last_raw_output = ""
-    cleaned_response = ""
-
-    # Deepcopy the state to avoid polluting history across retries
-    original_state = copy.deepcopy(state)
+    raw_attempts = []
 
     for attempt in range(max_retries):
-        # Use a fresh copy of the state for each attempt
-        current_state = copy.deepcopy(original_state)
+        # --- PASS 1: CREATIVE ---
+        # Use a deepcopy of the state to avoid polluting the main history.
+        # No special creative_prompt is needed; the natural character context is sufficient.
+        creative_state = copy.deepcopy(state)
 
-        full_response = ""
-        # Correctly call the generator using generate_in_executor
-        func = partial(custom_chatbot_wrapper, text=text, state=current_state, **kwargs)
-        response_generator = generate_in_executor(func)
-        
-        # The generator yields the full history, so we just need the last one.
-        async for response_chunk in response_generator:
+        # Generate the initial, potentially messy response
+        creative_func = partial(custom_chatbot_wrapper, text=text, state=creative_state, **kwargs)
+        creative_generator = generate_in_executor(creative_func)
+        pass1_raw_output = ""
+        async for response_chunk in creative_generator:
             if response_chunk.get('internal') and isinstance(response_chunk['internal'], list) and len(response_chunk['internal']) > 0:
-                full_response = response_chunk['internal'][-1][1]
-        
-        last_raw_output = full_response
+                pass1_raw_output = response_chunk['internal'][-1][1]
 
-        # 1. Ignore any thinking process before a </think> tag
-        cleaned_response = full_response
-        if '</think>' in cleaned_response:
-            cleaned_response = cleaned_response.split('</think>', 1)[-1]
+        # --- PASS 2: REFINER ---
+        # Create the refiner state by copying the original state.
+        # This ensures all necessary default values (like stopping_strings) are present.
+        refiner_state = copy.deepcopy(state)
+        refiner_state['stream'] = False  # We need the full response for parsing, so disable streaming
 
-        # 2. Find the content of the LAST <chatting> tag.
-        last_chat_pos = cleaned_response.rfind('<chatting>')
+        # Construct the prompt for the refiner
+        refiner_prompt_text = f"{refiner_prompt}\n\n--- TEXT TO REFINE ---\n{pass1_raw_output}\n\n--- REFINED OUTPUT ---\n"
+
+        # Use the low-level generate_reply for raw text completion
+        # This is a synchronous generator, so we need to handle it accordingly
+        pass2_refined_output = ""
+        reply_generator = generate_reply(refiner_prompt_text, refiner_state, is_chat=False)
+        for reply in reply_generator:
+            pass2_refined_output = reply
+
+        raw_attempts.append({
+            "pass1_creative_output": pass1_raw_output,
+            "pass2_refined_output": pass2_refined_output
+        })
+
+        # --- FINAL EXTRACTION ---
+        # Use the simple "Last Block Extraction" on the refined output
+        last_chat_pos = pass2_refined_output.rfind('<chatting>')
         if last_chat_pos != -1:
-            # Get the substring from the last <chatting> tag to the end
-            substring = cleaned_response[last_chat_pos + len('<chatting>'):]
-            
-            # Find the first closing tag in the substring
+            substring = pass2_refined_output[last_chat_pos + len('<chatting>'):]
             end_chat_pos = substring.find('</chatting>')
-            
             if end_chat_pos != -1:
                 final_answer = substring[:end_chat_pos].strip()
-            else:
-                # If no closing tag, take the whole substring
-                final_answer = substring.strip()
+                log_precise_entry(text, raw_attempts, final_answer, f"from attempt {attempt + 1}")
+                return final_answer
 
-            log_precise_answer(text, last_raw_output, final_answer)
-            return final_answer
-        
         # If no match, wait a moment before retrying
         if attempt < max_retries - 1:
             await asyncio.sleep(1)
 
-    # 3. If after all retries no tags are found, use the last full, cleaned response as a fallback.
-    final_answer = cleaned_response.strip()
-    log_precise_answer(text, last_raw_output, final_answer)
+    # Fallback if all retries fail
+    final_answer = "I am sorry, I am having trouble formulating a response."
+    log_precise_entry(text, raw_attempts, final_answer, f"fallback after {max_retries} retries")
     return final_answer
