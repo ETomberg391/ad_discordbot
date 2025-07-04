@@ -50,13 +50,13 @@ llmstate:
   state:
     preset: ''  # Name of a file in '/presets' (ex. 'Midnight Enigma'). Preset settings will override values defined here.
     grammar_string: ''
-    add_bos_token: true
+    add_bos_token: false
     auto_max_new_tokens: false
     ban_eos_token: false
     character_menu: ''
     chat_generation_attempts: 1
     chat_prompt_size: 2048
-    custom_stopping_strings: []
+    custom_stopping_strings: ["### Assistant","### Human","</END>","\nname1","\nname2"]
     custom_system_message: ''
     custom_token_bans: ''
     do_sample: true
@@ -78,7 +78,7 @@ llmstate:
     history:
       internal: []
       visible: []
-    max_new_tokens: 512
+    max_new_tokens: 1024
     max_tokens_second: 0
     max_updates_second: 12
     min_p: 0.00
@@ -96,7 +96,7 @@ llmstate:
     presence_penalty: 0
     prompt_lookup_num_tokens: 0
     repetition_penalty: 1.30
-    repetition_penalty_range: 1024
+    repetition_penalty_range: 30
     sampler_priority: []
     seed: -1.0
     show_after: ''
@@ -105,7 +105,7 @@ llmstate:
     smoothing_factor: 0
     static_cache: false
     stop_at_newline: false
-    stopping_strings: []
+    stopping_strings: ["### Assistant","### Human","</END>","\nname1","\nname2"]
     stream: false
     temperature: 0.6
     temperature_last: false

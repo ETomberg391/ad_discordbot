@@ -63,6 +63,7 @@ async def get_precise_answer(text, state, **kwargs):
     state['skip_html_escape'] = True
 
     # --- PROMPTS ---
+    # This is the new "few-shot" prompt that gives a direct command and a clear example.
     refiner_prompt_template = """Transform the following text into a clean response. Remove all third-person descriptions and meta-commentary. Enclose the final, pure first-person response in <chatting> tags.
 
 --- EXAMPLE ---
