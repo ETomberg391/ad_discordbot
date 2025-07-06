@@ -11,8 +11,10 @@ A new module will be created to contain the core logic for the "precise answers"
 -   **Key Function:** A function named `get_precise_answer` will be the main entry point for this module.
     -   It will accept the user's prompt and the current `state` dictionary.
     -   It will inject a system prompt into the context to instruct the LLM to formulate a response, use `<thinking>` tags for internal thoughts, and wrap the final reply in `<chatting>` tags.
+    -   It will dynamically add `</chatting>` as a stopping string to the API call to prevent the model from generating extra text after the response.
     -   It will make a single call to the `custom_chatbot_wrapper` to get the raw response from the LLM.
-    -   It will parse the LLM's response by first ignoring any text before the last `</think>` or `</thinking>` tag, and then extracting the content from the last `<chatting>...</chatting>` block.
+    -   It will append the `</chatting>` tag to the raw response to ensure the block is complete, as using it as a stop string removes it from the output.
+    -   It will parse the LLM's response by finding the last `</chatting>` tag and working backward to find its corresponding `<chatting>` tag, reliably extracting the content.
     -   It will implement a retry mechanism (up to 4 attempts) if the tags are not found in the response. If it fails after all retries, it will return a fallback message.
 
 ## 2. Modify `bot.py` to add the `/precise_answers` command
@@ -65,6 +67,12 @@ async def get_precise_answer(text, state, **kwargs):
         state_copy = copy.deepcopy(state)
         state_copy['context'] = f"{system_prompt}\n{original_context}"
 
+        # Dynamically add '</chatting>' to the stopping strings to prevent the model from looping.
+        stopping_strings = state_copy.get('stopping_strings', [])
+        if '</chatting>' not in stopping_strings:
+            stopping_strings.append('</chatting>')
+        state_copy['stopping_strings'] = stopping_strings
+
         # Use the same async execution pattern as the original creative pass
         llm_func = partial(custom_chatbot_wrapper, text=text, state=state_copy, **kwargs)
         llm_generator = generate_in_executor(llm_func)
@@ -74,28 +82,20 @@ async def get_precise_answer(text, state, **kwargs):
             if response_chunk.get('internal') and isinstance(response_chunk['internal'], list) and len(response_chunk['internal']) > 0:
                 full_response = response_chunk['internal'][-1][1]
 
+        # If we used '</chatting>' as a stop string, the model output will likely be missing it.
+        # We add it back before parsing to ensure the block is complete.
+        full_response += '</chatting>'
+
         attempts_list.append({"raw_output": full_response})
 
         # --- PARSING ---
-        processed_response = full_response
-
-        # 1. Ignore anything before the last </think> tag
-        last_think_pos = processed_response.rfind('</think>')
-        if last_think_pos != -1:
-            processed_response = processed_response[last_think_pos + len('</think>'):]
-
-        # 2. Ignore anything before the last </thinking> tag
-        last_thinking_pos = processed_response.rfind('</thinking>')
-        if last_thinking_pos != -1:
-            processed_response = processed_response[last_thinking_pos + len('</thinking>'):]
-
-        # 3. Find the last <chatting>...</chatting> block
-        last_chat_pos = processed_response.rfind('<chatting>')
-        if last_chat_pos != -1:
-            substring = processed_response[last_chat_pos + len('<chatting>'):]
-            end_chat_pos = substring.find('</chatting>')
-            if end_chat_pos != -1:
-                final_answer = substring[:end_chat_pos].strip()
+        # Find the last occurrence of </chatting> and work backwards to find the start.
+        # This is more robust than regex or multi-step parsing.
+        end_chat_pos = full_response.rfind('</chatting>')
+        if end_chat_pos != -1:
+            start_chat_pos = full_response.rfind('<chatting>', 0, end_chat_pos)
+            if start_chat_pos != -1:
+                final_answer = full_response[start_chat_pos + len('<chatting>'):end_chat_pos].strip()
                 log_precise_entry(text, attempts_list, final_answer, f"from attempt {attempt + 1}")
                 return final_answer
 
@@ -119,21 +119,20 @@ graph TD
     B -- No --> C[Normal response flow];
     B -- Yes --> D[Precise response flow];
     D --> E[message_llm_task calls get_precise_answer];
-    E --> F[get_precise_answer adds system prompt to context];
+    E --> F[get_precise_answer adds system prompt & stop string];
     F --> G[get_precise_answer calls custom_chatbot_wrapper];
-    G --> H{Parse LLM Response};
-    H --> I{Find last </think> tag};
-    I --> J{Find last </thinking> tag};
-    J --> K{Find last <chatting> block};
-    K -- Found --> L[Extract text from tags];
-    K -- Not Found --> M{Retry up to 4 times};
-    M -- Success --> L;
-    M -- Failure --> O[Return fallback message];
-    L --> P[Send response to user];
-    O --> P;
-    C --> P;
+    G --> H[Append '</chatting>' to response];
+    H --> I{Parse LLM Response};
+    I --> J{Find last <chatting>...</chatting> block};
+    J -- Found --> K[Extract text from tags];
+    J -- Not Found --> L{Retry up to 4 times};
+    L -- Success --> K;
+    L -- Failure --> M[Return fallback message];
+    K --> N[Send response to user];
+    M --> N;
+    C --> N;
 
-    Q[User uses /precise_answers command] --> R[Toggle state in bot_database];
+    O[User uses /precise_answers command] --> P[Toggle state in bot_database];
 ```
 
 This plan provides a clear path to implementing the desired functionality in a modular and maintainable way.

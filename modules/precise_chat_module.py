@@ -66,6 +66,12 @@ async def get_precise_answer(text, state, **kwargs):
         state_copy = copy.deepcopy(state)
         state_copy['context'] = f"{system_prompt}\n{original_context}"
 
+        # Dynamically add '</chatting>' to the stopping strings to prevent the model from looping.
+        stopping_strings = state_copy.get('stopping_strings', [])
+        if '</chatting>' not in stopping_strings:
+            stopping_strings.append('</chatting>')
+        state_copy['stopping_strings'] = stopping_strings
+
         # Use the same async execution pattern as the original creative pass
         llm_func = partial(custom_chatbot_wrapper, text=text, state=state_copy, **kwargs)
         llm_generator = generate_in_executor(llm_func)
@@ -75,28 +81,20 @@ async def get_precise_answer(text, state, **kwargs):
             if response_chunk.get('internal') and isinstance(response_chunk['internal'], list) and len(response_chunk['internal']) > 0:
                 full_response = response_chunk['internal'][-1][1]
 
+        # If we used '</chatting>' as a stop string, the model output will likely be missing it.
+        # We add it back before parsing to ensure the block is complete.
+        full_response += '</chatting>'
+
         attempts_list.append({"raw_output": full_response})
 
         # --- PARSING ---
-        processed_response = full_response
-
-        # 1. Ignore anything before the last </think> tag
-        last_think_pos = processed_response.rfind('</think>')
-        if last_think_pos != -1:
-            processed_response = processed_response[last_think_pos + len('</think>'):]
-
-        # 2. Ignore anything before the last </thinking> tag
-        last_thinking_pos = processed_response.rfind('</thinking>')
-        if last_thinking_pos != -1:
-            processed_response = processed_response[last_thinking_pos + len('</thinking>'):]
-
-        # 3. Find the last <chatting>...</chatting> block
-        last_chat_pos = processed_response.rfind('<chatting>')
-        if last_chat_pos != -1:
-            substring = processed_response[last_chat_pos + len('<chatting>'):]
-            end_chat_pos = substring.find('</chatting>')
-            if end_chat_pos != -1:
-                final_answer = substring[:end_chat_pos].strip()
+        # Find the last occurrence of </chatting> and work backwards to find the start.
+        # This is more robust than regex or multi-step parsing.
+        end_chat_pos = full_response.rfind('</chatting>')
+        if end_chat_pos != -1:
+            start_chat_pos = full_response.rfind('<chatting>', 0, end_chat_pos)
+            if start_chat_pos != -1:
+                final_answer = full_response[start_chat_pos + len('<chatting>'):end_chat_pos].strip()
                 log_precise_entry(text, attempts_list, final_answer, f"from attempt {attempt + 1}")
                 return final_answer
 
