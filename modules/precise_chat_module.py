@@ -3,7 +3,6 @@ import asyncio
 from functools import partial
 import copy
 from modules.utils_tgwui import custom_chatbot_wrapper
-from modules.text_generation import generate_reply
 from modules.utils_asyncio import generate_in_executor
 import os
 from datetime import datetime
@@ -19,7 +18,7 @@ def _initialize_session_log():
     SESSION_LOG_FILE = os.path.join(LOG_DIR, f"session_{timestamp}.log")
 
 def log_precise_entry(input_text, attempts_list, final_answer, source):
-    """Logs a complete interaction entry to the session log file, supporting two-pass architecture."""
+    """Logs a complete interaction entry to the session log file."""
     if not SESSION_LOG_FILE:
         return
 
@@ -29,17 +28,8 @@ def log_precise_entry(input_text, attempts_list, final_answer, source):
     )
 
     for i, attempt_data in enumerate(attempts_list):
-        # Handle both old string-based attempts and new dict-based attempts for compatibility
-        if isinstance(attempt_data, dict):
-            pass1_out = attempt_data.get("pass1_creative_output", "N/A")
-            pass2_out = attempt_data.get("pass2_refined_output", "N/A")
-            log_content += (
-                f"--- ATTEMPT {i + 1} ---\n"
-                f"--- PASS 1 (Creative) RAW OUTPUT ---\n{pass1_out}\n\n"
-                f"--- PASS 2 (Refiner) RAW OUTPUT ---\n{pass2_out}\n\n"
-            )
-        else:  # Fallback for old log format
-            log_content += f"--- ATTEMPT {i + 1} RAW LLM OUTPUT ---\n{attempt_data}\n\n"
+        raw_output = attempt_data.get("raw_output", "N/A")
+        log_content += f"--- ATTEMPT {i + 1} RAW LLM OUTPUT ---\n{raw_output}\n\n"
 
     log_content += (
         f"--- FINAL ANSWER ({source}) ---\n{final_answer}\n"
@@ -55,86 +45,66 @@ _initialize_session_log()
 
 async def get_precise_answer(text, state, **kwargs):
     """
-    Generates a precise answer using a two-pass refinement architecture.
-    1. Creative Pass: Generates a rich, in-character response.
-    2. Refiner Pass: Cleans and formats the response from Pass 1.
+    Generates a precise, in-character answer by making a single call to the LLM,
+    instructing it to use <chatting> tags. Retries up to 4 times.
     """
-    # Set flag to skip HTML escaping in the core wrapper
     state['skip_html_escape'] = True
 
-    # --- PROMPTS ---
-    # This is the new "few-shot" prompt that gives a direct command and a clear example.
-    refiner_prompt_template = """Transform the following text into a clean response. Remove all third-person descriptions and meta-commentary. Enclose the final, pure first-person response in <chatting> tags.
+    system_prompt = (
+        "You are an AI character. Your goal is to provide an in-character response. "
+        "You can think to yourself using <thinking>...</thinking> tags, but this will be hidden from the user. "
+        "Your final, user-visible response MUST be enclosed in a single <chatting>...</chatting> block. "
+        "For example: <thinking>I should respond politely.</thinking><chatting>Hello there! How can I help you?</chatting>"
+    )
 
---- EXAMPLE ---
-TEXT TO REFINE:
-*He tilts his head.* I am well, thank you. How are you?
-
-REFINED OUTPUT:
-<chatting>I am well, thank you. How are you?</chatting>
---- END EXAMPLE ---
-
---- TASK ---
-TEXT TO REFINE:
-{pass1_raw_output}
-
-REFINED OUTPUT:
-"""
-
-    max_retries = 3
-    raw_attempts = []
+    max_retries = 4
+    attempts_list = []
+    original_context = state.get('context', '')
 
     for attempt in range(max_retries):
-        # --- PASS 1: CREATIVE ---
-        # Use a deepcopy of the state to avoid polluting the main history.
-        # No special creative_prompt is needed; the natural character context is sufficient.
-        creative_state = copy.deepcopy(state)
+        # Use a deepcopy of the state to avoid polluting the main history with system prompts.
+        state_copy = copy.deepcopy(state)
+        state_copy['context'] = f"{system_prompt}\n{original_context}"
 
-        # Generate the initial, potentially messy response
-        creative_func = partial(custom_chatbot_wrapper, text=text, state=creative_state, **kwargs)
-        creative_generator = generate_in_executor(creative_func)
-        pass1_raw_output = ""
-        async for response_chunk in creative_generator:
+        # Use the same async execution pattern as the original creative pass
+        llm_func = partial(custom_chatbot_wrapper, text=text, state=state_copy, **kwargs)
+        llm_generator = generate_in_executor(llm_func)
+
+        full_response = ""
+        async for response_chunk in llm_generator:
             if response_chunk.get('internal') and isinstance(response_chunk['internal'], list) and len(response_chunk['internal']) > 0:
-                pass1_raw_output = response_chunk['internal'][-1][1]
+                full_response = response_chunk['internal'][-1][1]
 
-        # --- PASS 2: REFINER ---
-        # Create the refiner state by copying the original state.
-        # This ensures all necessary default values (like stopping_strings) are present.
-        refiner_state = copy.deepcopy(state)
-        refiner_state['stream'] = False  # We need the full response for parsing, so disable streaming
+        attempts_list.append({"raw_output": full_response})
 
-        # Construct the prompt for the refiner using the few-shot template
-        refiner_prompt_text = refiner_prompt_template.format(pass1_raw_output=pass1_raw_output)
+        # --- PARSING ---
+        processed_response = full_response
 
-        # Use the low-level generate_reply for raw text completion
-        # This is a synchronous generator, so we need to handle it accordingly
-        pass2_refined_output = ""
-        reply_generator = generate_reply(refiner_prompt_text, refiner_state, is_chat=False)
-        for reply in reply_generator:
-            pass2_refined_output = reply
+        # 1. Ignore anything before the last </think> tag
+        last_think_pos = processed_response.rfind('</think>')
+        if last_think_pos != -1:
+            processed_response = processed_response[last_think_pos + len('</think>'):]
 
-        raw_attempts.append({
-            "pass1_creative_output": pass1_raw_output,
-            "pass2_refined_output": pass2_refined_output
-        })
+        # 2. Ignore anything before the last </thinking> tag
+        last_thinking_pos = processed_response.rfind('</thinking>')
+        if last_thinking_pos != -1:
+            processed_response = processed_response[last_thinking_pos + len('</thinking>'):]
 
-        # --- FINAL EXTRACTION ---
-        # Use the simple "Last Block Extraction" on the refined output
-        last_chat_pos = pass2_refined_output.rfind('<chatting>')
+        # 3. Find the last <chatting>...</chatting> block
+        last_chat_pos = processed_response.rfind('<chatting>')
         if last_chat_pos != -1:
-            substring = pass2_refined_output[last_chat_pos + len('<chatting>'):]
+            substring = processed_response[last_chat_pos + len('<chatting>'):]
             end_chat_pos = substring.find('</chatting>')
             if end_chat_pos != -1:
                 final_answer = substring[:end_chat_pos].strip()
-                log_precise_entry(text, raw_attempts, final_answer, f"from attempt {attempt + 1}")
+                log_precise_entry(text, attempts_list, final_answer, f"from attempt {attempt + 1}")
                 return final_answer
 
-        # If no match, wait a moment before retrying
+        # If no match, wait before retrying
         if attempt < max_retries - 1:
             await asyncio.sleep(1)
 
     # Fallback if all retries fail
-    final_answer = "I am sorry, I am having trouble formulating a response."
-    log_precise_entry(text, raw_attempts, final_answer, f"fallback after {max_retries} retries")
-    return final_answer
+    final_fallback_response = "I am sorry, I am having trouble formulating a response."
+    log_precise_entry(text, attempts_list, final_fallback_response, f"fallback after {max_retries} retries")
+    return final_fallback_response

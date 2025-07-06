@@ -10,10 +10,10 @@ A new module will be created to contain the core logic for the "precise answers"
 -   **Purpose:** This module will be responsible for generating the precisely formatted answer.
 -   **Key Function:** A function named `get_precise_answer` will be the main entry point for this module.
     -   It will accept the user's prompt and the current `state` dictionary.
-    -   It will inject a system prompt into the context to instruct the LLM to use `<chatting>` tags for its response.
-    -   It will call the existing `custom_chatbot_wrapper` to get the raw response from the LLM.
-    -   It will parse the LLM's response to find and extract the content within the last pair of `<chatting>...</chatting>` tags.
-    -   It will implement a retry mechanism (up to 3 attempts) if the tags are not found in the response. If it fails after all retries, it will return the last full, unparsed response.
+    -   It will inject a system prompt into the context to instruct the LLM to formulate a response, use `<thinking>` tags for internal thoughts, and wrap the final reply in `<chatting>` tags.
+    -   It will make a single call to the `custom_chatbot_wrapper` to get the raw response from the LLM.
+    -   It will parse the LLM's response by first ignoring any text before the last `</think>` or `</thinking>` tag, and then extracting the content from the last `<chatting>...</chatting>` block.
+    -   It will implement a retry mechanism (up to 4 attempts) if the tags are not found in the response. If it fails after all retries, it will return a fallback message.
 
 ## 2. Modify `bot.py` to add the `/precise_answers` command
 
@@ -37,40 +37,76 @@ The existing message processing logic will be adapted to incorporate the new mod
 
 ## 4. Detailed Logic for `precise_chat_module.py`
 
-Here is a more detailed look at the proposed implementation of the `get_precise_answer` function:
+Here is a more detailed look at the simplified implementation of the `get_precise_answer` function:
 
 ```python
-# precise_chat_module.py
-
-import re
-from modules.utils_tgwui import custom_chatbot_wrapper # And other necessary imports
+# ad_discordbot/modules/precise_chat_module.py
 
 async def get_precise_answer(text, state, **kwargs):
     """
-    Generates a precise answer by instructing the LLM to use <chatting> tags.
+    Generates a precise, in-character answer by making a single call to the LLM,
+    instructing it to use <chatting> tags. Retries up to 4 times.
     """
-    system_prompt = "You must provide your response within <chatting> brackets. For example: <chatting>Your response here.</chatting>"
-    
-    original_context = state.get('context', '')
-    state['context'] = f"{system_prompt}\\n{original_context}"
+    state['skip_html_escape'] = True
 
-    for attempt in range(3):
+    system_prompt = (
+        "You are an AI character. Your goal is to provide an in-character response. "
+        "You can think to yourself using <thinking>...</thinking> tags, but this will be hidden from the user. "
+        "Your final, user-visible response MUST be enclosed in a single <chatting>...</chatting> block. "
+        "For example: <thinking>I should respond politely.</thinking><chatting>Hello there! How can I help you?</chatting>"
+    )
+
+    max_retries = 4
+    attempts_list = []
+    original_context = state.get('context', '')
+
+    for attempt in range(max_retries):
+        # Use a deepcopy of the state to avoid polluting the main history with system prompts.
+        state_copy = copy.deepcopy(state)
+        state_copy['context'] = f"{system_prompt}\n{original_context}"
+
+        # Use the same async execution pattern as the original creative pass
+        llm_func = partial(custom_chatbot_wrapper, text=text, state=state_copy, **kwargs)
+        llm_generator = generate_in_executor(llm_func)
+
         full_response = ""
-        async for response_chunk in custom_chatbot_wrapper(text, state, **kwargs):
-            if response_chunk.get('internal'):
+        async for response_chunk in llm_generator:
+            if response_chunk.get('internal') and isinstance(response_chunk['internal'], list) and len(response_chunk['internal']) > 0:
                 full_response = response_chunk['internal'][-1][1]
 
-        # Ignore anything before </think> if present
-        if '</think>' in full_response:
-            full_response = full_response.split('</think>')[-1]
+        attempts_list.append({"raw_output": full_response})
 
-        # Find the last <chatting>...</chatting> block
-        matches = re.findall(r'<chatting>(.*?)</chatting>', full_response, re.DOTALL)
-        if matches:
-            return matches[-1].strip()
+        # --- PARSING ---
+        processed_response = full_response
 
-    # If after 3 attempts no tags are found, return the last full response.
-    return full_response
+        # 1. Ignore anything before the last </think> tag
+        last_think_pos = processed_response.rfind('</think>')
+        if last_think_pos != -1:
+            processed_response = processed_response[last_think_pos + len('</think>'):]
+
+        # 2. Ignore anything before the last </thinking> tag
+        last_thinking_pos = processed_response.rfind('</thinking>')
+        if last_thinking_pos != -1:
+            processed_response = processed_response[last_thinking_pos + len('</thinking>'):]
+
+        # 3. Find the last <chatting>...</chatting> block
+        last_chat_pos = processed_response.rfind('<chatting>')
+        if last_chat_pos != -1:
+            substring = processed_response[last_chat_pos + len('<chatting>'):]
+            end_chat_pos = substring.find('</chatting>')
+            if end_chat_pos != -1:
+                final_answer = substring[:end_chat_pos].strip()
+                log_precise_entry(text, attempts_list, final_answer, f"from attempt {attempt + 1}")
+                return final_answer
+
+        # If no match, wait before retrying
+        if attempt < max_retries - 1:
+            await asyncio.sleep(1)
+
+    # Fallback if all retries fail
+    final_fallback_response = "I am sorry, I am having trouble formulating a response."
+    log_precise_entry(text, attempts_list, final_fallback_response, f"fallback after {max_retries} retries")
+    return final_fallback_response
 ```
 
 ## 5. Mermaid Diagram of the Plan
@@ -80,21 +116,24 @@ The following diagram illustrates the proposed architecture and flow:
 ```mermaid
 graph TD
     A[User sends message] --> B{/precise_answers enabled?};
-    B -- No --> C[Normal response flow: on_message -> TaskManager -> message_llm_task];
+    B -- No --> C[Normal response flow];
     B -- Yes --> D[Precise response flow];
-    D --> E[message_llm_task calls precise_chat_module.get_precise_answer];
-    E --> F[get_precise_answer adds system prompt];
+    D --> E[message_llm_task calls get_precise_answer];
+    E --> F[get_precise_answer adds system prompt to context];
     F --> G[get_precise_answer calls custom_chatbot_wrapper];
-    G --> H{LLM responds with <chatting> tags};
-    H -- Yes --> I[Extract text from tags];
-    H -- No --> J{Retry up to 3 times};
-    J -- Success --> I;
-    J -- Failure --> K[Return full response];
-    I --> L[Send response to user];
-    K --> L;
-    C --> L;
+    G --> H{Parse LLM Response};
+    H --> I{Find last </think> tag};
+    I --> J{Find last </thinking> tag};
+    J --> K{Find last <chatting> block};
+    K -- Found --> L[Extract text from tags];
+    K -- Not Found --> M{Retry up to 4 times};
+    M -- Success --> L;
+    M -- Failure --> O[Return fallback message];
+    L --> P[Send response to user];
+    O --> P;
+    C --> P;
 
-    M[User uses /precise_answers command] --> N[Toggle state in bot_database];
+    Q[User uses /precise_answers command] --> R[Toggle state in bot_database];
 ```
 
 This plan provides a clear path to implementing the desired functionality in a modular and maintainable way.
