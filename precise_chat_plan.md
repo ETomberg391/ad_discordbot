@@ -10,11 +10,10 @@ A new module will be created to contain the core logic for the "precise answers"
 -   **Purpose:** This module will be responsible for generating the precisely formatted answer.
 -   **Key Function:** A function named `get_precise_answer` will be the main entry point for this module.
     -   It will accept the user's prompt and the current `state` dictionary.
-    -   It will inject a system prompt into the context to instruct the LLM to formulate a response, use `<thinking>` tags for internal thoughts, and wrap the final reply in `<chatting>` tags.
-    -   It will dynamically add `</chatting>` as a stopping string to the API call to prevent the model from generating extra text after the response.
-    -   It will make a single call to the `custom_chatbot_wrapper` to get the raw response from the LLM.
-    -   It will append the `</chatting>` tag to the raw response to ensure the block is complete, as using it as a stop string removes it from the output.
-    -   It will parse the LLM's response by finding the last `</chatting>` tag and working backward to find its corresponding `<chatting>` tag, reliably extracting the content.
+    -   It will use a two-pass architecture:
+        1.  **Creative Pass:** Generate an in-character response using the `custom_chatbot_wrapper`.
+        2.  **Refiner Pass:** Take the output from the creative pass and use a second, raw `generate_reply` call with strict, non-creative parameters to enclose it in `<chatting>` tags.
+    -   It will parse the output of the refiner pass to extract the final, clean response.
     -   It will implement a retry mechanism (up to 4 attempts) if the tags are not found in the response. If it fails after all retries, it will return a fallback message.
 
 ## 2. Modify `bot.py` to add the `/precise_answers` command
@@ -43,63 +42,75 @@ Here is a more detailed look at the simplified implementation of the `get_precis
 
 ```python
 # ad_discordbot/modules/precise_chat_module.py
+import re
+import asyncio
+from functools import partial
+import copy
+from modules.utils_tgwui import custom_chatbot_wrapper
+from modules.text_generation import generate_reply
+from modules.utils_asyncio import generate_in_executor
+import os
+from datetime import datetime
 
 async def get_precise_answer(text, state, **kwargs):
     """
-    Generates a precise, in-character answer by making a single call to the LLM,
-    instructing it to use <chatting> tags. Retries up to 4 times.
+    Generates a precise answer using a two-pass refinement architecture.
+    1. Creative Pass: Generates a rich, in-character response.
+    2. Refiner Pass: Cleans and formats the response from Pass 1.
     """
     state['skip_html_escape'] = True
 
-    system_prompt = (
-        "You are an AI character. Your goal is to provide an in-character response. "
-        "You can think to yourself using <thinking>...</thinking> tags, but this will be hidden from the user. "
-        "Your final, user-visible response MUST be enclosed in a single <chatting>...</chatting> block. "
-        "For example: <thinking>I should respond politely.</thinking><chatting>Hello there! How can I help you?</chatting>"
-    )
+    refiner_prompt_template = "Enclose the following text in <chatting> tags: {creative_output}"
 
     max_retries = 4
     attempts_list = []
-    original_context = state.get('context', '')
 
     for attempt in range(max_retries):
-        # Use a deepcopy of the state to avoid polluting the main history with system prompts.
-        state_copy = copy.deepcopy(state)
-        state_copy['context'] = f"{system_prompt}\n{original_context}"
+        # --- PASS 1: CREATIVE ---
+        # Use a deepcopy of the state to avoid polluting the main history.
+        creative_state = copy.deepcopy(state)
 
-        # Dynamically add '</chatting>' to the stopping strings to prevent the model from looping.
-        stopping_strings = state_copy.get('stopping_strings', [])
-        if '</chatting>' not in stopping_strings:
-            stopping_strings.append('</chatting>')
-        state_copy['stopping_strings'] = stopping_strings
-
-        # Use the same async execution pattern as the original creative pass
-        llm_func = partial(custom_chatbot_wrapper, text=text, state=state_copy, **kwargs)
-        llm_generator = generate_in_executor(llm_func)
-
-        full_response = ""
-        async for response_chunk in llm_generator:
+        creative_func = partial(custom_chatbot_wrapper, text=text, state=creative_state, **kwargs)
+        creative_generator = generate_in_executor(creative_func)
+        pass1_raw_output = ""
+        async for response_chunk in creative_generator:
             if response_chunk.get('internal') and isinstance(response_chunk['internal'], list) and len(response_chunk['internal']) > 0:
-                full_response = response_chunk['internal'][-1][1]
+                pass1_raw_output = response_chunk['internal'][-1][1]
 
-        # If we used '</chatting>' as a stop string, the model output will likely be missing it.
-        # We add it back before parsing to ensure the block is complete.
-        full_response += '</chatting>'
+        # --- PASS 2: REFINER ---
+        # Use a separate, non-creative state for the refiner pass.
+        refiner_state = {
+            'max_new_tokens': len(pass1_raw_output) + 50, # Allow enough tokens for tags and minor variance
+            'temperature': 0.01,
+            'top_p': 0.1,
+            'top_k': 1,
+            'repetition_penalty': 1.0,
+            'stopping_strings': ['</chatting>']
+        }
+        refiner_prompt_text = refiner_prompt_template.format(creative_output=pass1_raw_output)
+        
+        # Use the low-level generate_reply for raw text completion
+        pass2_refined_output = ""
+        reply_generator = generate_reply(refiner_prompt_text, refiner_state, is_chat=False)
+        for reply in reply_generator:
+            pass2_refined_output = reply
+        
+        # Add the closing tag back if it was used as a stop string
+        if not pass2_refined_output.endswith('</chatting>'):
+            pass2_refined_output += '</chatting>'
 
-        attempts_list.append({"raw_output": full_response})
+        attempts_list.append({
+            "pass1_creative_output": pass1_raw_output,
+            "pass2_refined_output": pass2_refined_output
+        })
 
-        # --- PARSING ---
-        # Find the last occurrence of </chatting> and work backwards to find the start.
-        # This is more robust than regex or multi-step parsing.
-        end_chat_pos = full_response.rfind('</chatting>')
-        if end_chat_pos != -1:
-            start_chat_pos = full_response.rfind('<chatting>', 0, end_chat_pos)
-            if start_chat_pos != -1:
-                final_answer = full_response[start_chat_pos + len('<chatting>'):end_chat_pos].strip()
-                log_precise_entry(text, attempts_list, final_answer, f"from attempt {attempt + 1}")
-                return final_answer
+        # --- FINAL EXTRACTION ---
+        matches = re.findall(r'<chatting>(.*?)</chatting>', pass2_refined_output, re.DOTALL)
+        if matches:
+            final_answer = matches[-1].strip()
+            log_precise_entry(text, attempts_list, final_answer, f"from attempt {attempt + 1}")
+            return final_answer
 
-        # If no match, wait before retrying
         if attempt < max_retries - 1:
             await asyncio.sleep(1)
 
@@ -119,20 +130,21 @@ graph TD
     B -- No --> C[Normal response flow];
     B -- Yes --> D[Precise response flow];
     D --> E[message_llm_task calls get_precise_answer];
-    E --> F[get_precise_answer adds system prompt & stop string];
-    F --> G[get_precise_answer calls custom_chatbot_wrapper];
-    G --> H[Append '</chatting>' to response];
-    H --> I{Parse LLM Response};
-    I --> J{Find last <chatting>...</chatting> block};
-    J -- Found --> K[Extract text from tags];
-    J -- Not Found --> L{Retry up to 4 times};
-    L -- Success --> K;
-    L -- Failure --> M[Return fallback message];
-    K --> N[Send response to user];
-    M --> N;
-    C --> N;
+    subgraph Two-Pass System
+        E --> F[Pass 1: Creative Generation];
+        F --> G[Pass 2: Refinement];
+    end
+    G --> H{Parse Refined Output};
+    H --> I{Find <chatting> block};
+    I -- Found --> J[Extract text from tags];
+    I -- Not Found --> K{Retry up to 4 times};
+    K -- Success --> J;
+    K -- Failure --> L[Return fallback message];
+    J --> M[Send response to user];
+    L --> M;
+    C --> M;
 
-    O[User uses /precise_answers command] --> P[Toggle state in bot_database];
+    N[User uses /precise_answers command] --> O[Toggle state in bot_database];
 ```
 
 This plan provides a clear path to implementing the desired functionality in a modular and maintainable way.
